@@ -1,0 +1,2 @@
+# Packet-Sniffer-with-Attack-simulation-and-detection---IS-Project
+This project is a Network Scanner and Security Analyzer that combines passive sniffing, active host discovery, and vulnerability detection to give a comprehensive view of a network. Built using Python (asyncio + scapy) with real-time packet sniffing, ARP discovery, port scanning, OS fingerprinting, SSL inspection, attacks simulation and detection.
